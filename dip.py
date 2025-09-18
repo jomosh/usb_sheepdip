@@ -7,6 +7,8 @@ from pathlib import Path
 import psutil
 import threading
 import sys
+import subprocess
+import re
 
 class USBVirusScanner:
     def __init__(self, api_key):
@@ -17,39 +19,135 @@ class USBVirusScanner:
             "Content-Type": "application/json"
         }
         self.current_usb = None
+        self.initial_drives = []
         
+    def initialize_drives(self):
+        """Get initial drives but don't wait for them to be removed"""
+        self.initial_drives = self.get_removable_drives()
+        print(f"Initial removable drives: {self.initial_drives}")
+        
+        # If there are already USB drives mounted, ask if user wants to scan them
+        if self.initial_drives:
+            print("Found existing USB drives. Would you like to scan them?")
+            for i, drive in enumerate(self.initial_drives, 1):
+                print(f"{i}. {drive}")
+            
+            response = input("Enter the number to scan, or 'no' to wait for new USB: ")
+            
+            if response.isdigit() and 1 <= int(response) <= len(self.initial_drives):
+                selected_drive = self.initial_drives[int(response) - 1]
+                self.current_usb = selected_drive
+                return True
+            elif response.lower() in ['no', 'n']:
+                print("Waiting for new USB devices...")
+                return False
+            else:
+                print("Invalid input. Waiting for new USB devices...")
+                return False
+        
+        return False
+    
     def wait_for_usb_insertion(self):
         """Wait for a USB device to be inserted"""
         print("Waiting for USB device insertion...")
         
-        initial_drives = self.get_removable_drives()
+        # Get current state of drives
+        current_initial_drives = self.get_removable_drives()
         
         while True:
             current_drives = self.get_removable_drives()
-            new_drives = [d for d in current_drives if d not in initial_drives]
+            
+            # Check for new drives that weren't in the initial list
+            new_drives = [d for d in current_drives if d not in current_initial_drives]
             
             if new_drives:
                 self.current_usb = new_drives[0]
                 print(f"USB device detected: {self.current_usb}")
                 return True
             
+            # Check if any of the initial drives are still present (user might want to scan them later)
+            available_drives = [d for d in current_initial_drives if d in current_drives]
+            if available_drives and not self.initial_drives:
+                print(f"Available USB drives: {available_drives}")
+                response = input("Press 's' to scan an available drive, or any other key to continue waiting: ")
+                if response.lower() == 's':
+                    for i, drive in enumerate(available_drives, 1):
+                        print(f"{i}. {drive}")
+                    choice = input("Select drive number to scan: ")
+                    if choice.isdigit() and 1 <= int(choice) <= len(available_drives):
+                        self.current_usb = available_drives[int(choice) - 1]
+                        return True
+            
             time.sleep(2)
+    
+    def get_linux_usb_drives(self):
+        """Alternative method to detect USB drives on Linux"""
+        try:
+            # Use lsblk to find USB devices
+            result = subprocess.run(['lsblk', '-o', 'NAME,MOUNTPOINT,TRAN', '-n'], 
+                                  capture_output=True, text=True)
+            drives = []
+            
+            for line in result.stdout.split('\n'):
+                if 'usb' in line.lower() and '/media/' in line.lower():
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] and parts[1] != '/':
+                        drives.append(parts[1])
+            
+            # Also check /media directory for mounted devices
+            if os.path.exists('/media'):
+                for item in os.listdir('/media'):
+                    full_path = os.path.join('/media', item)
+                    if os.path.ismount(full_path):
+                        drives.append(full_path)
+            
+            # Check /run/media as well (common on newer Linux distros)
+            if os.path.exists('/run/media'):
+                try:
+                    user = os.getlogin()
+                    user_media = os.path.join('/run/media', user)
+                    if os.path.exists(user_media):
+                        for item in os.listdir(user_media):
+                            full_path = os.path.join(user_media, item)
+                            if os.path.ismount(full_path):
+                                drives.append(full_path)
+                except:
+                    pass
+            
+            return list(set(drives))  # Remove duplicates
+            
+        except Exception as e:
+            print(f"Error detecting Linux USB drives: {e}")
+            return []
     
     def get_removable_drives(self):
         """Get list of removable drives"""
         removable_drives = []
-        for partition in psutil.disk_partitions():
-            if 'removable' in partition.opts or self.is_usb_drive(partition.device):
-                removable_drives.append(partition.mountpoint)
+        
+        try:
+            for partition in psutil.disk_partitions():
+                # Windows detection
+                if sys.platform == "win32":
+                    if 'removable' in partition.opts.lower():
+                        removable_drives.append(partition.mountpoint)
+                # Linux detection
+                elif sys.platform.startswith('linux'):
+                    # Check common USB mount points and removable media
+                    mountpoint = partition.mountpoint.lower()
+                    if any(x in mountpoint for x in ['/media/', '/run/media/', '/mnt/']):
+                        removable_drives.append(partition.mountpoint)
+                    # Also check if device name suggests removable media
+                    elif any(x in partition.device.lower() for x in ['sd', 'mmc']):
+                        removable_drives.append(partition.mountpoint)
+                # macOS detection
+                elif sys.platform == "darwin":
+                    if '/Volumes/' in partition.mountpoint:
+                        removable_drives.append(partition.mountpoint)
+                        
+        except Exception as e:
+            print(f"Error getting removable drives: {e}")
+        
         return removable_drives
-    
-    def is_usb_drive(self, device_path):
-        """Check if device is likely a USB drive"""
-        # This is a simple heuristic - you might need to adjust for your OS
-        if sys.platform == "win32":
-            return "USB" in device_path.upper()
-        else:
-            return "sd" in device_path.lower() and len(device_path) <= 5
     
     def ask_confirmation(self):
         """Ask user for confirmation to scan"""
@@ -145,6 +243,11 @@ class USBVirusScanner:
     
     def scan_usb(self):
         """Main scanning procedure"""
+        # Verify the USB is still mounted
+        if not os.path.exists(self.current_usb):
+            print(f"USB device {self.current_usb} is no longer available")
+            return
+        
         # Get all file hashes
         file_hashes = self.get_all_file_hashes()
         
@@ -198,7 +301,15 @@ class USBVirusScanner:
     def run(self):
         """Main execution loop"""
         try:
+            # Initialize and check for existing drives
+            if self.initialize_drives():
+                if self.ask_confirmation():
+                    self.scan_usb()
+                else:
+                    print("Scan cancelled by user.")
+            
             while True:
+                print("\nMonitoring for new USB devices...")
                 if self.wait_for_usb_insertion():
                     if self.ask_confirmation():
                         self.scan_usb()
@@ -228,12 +339,13 @@ def main():
     print("USB Virus Scanner")
     print("=================")
     print("This program will:")
-    print("1. Wait for USB insertion")
-    print("2. Ask for confirmation to scan")
-    print("3. Scan all files on the USB")
-    print("4. Check files against VirusTotal")
-    print("5. Remove any infected files found")
-    print("6. Notify you when safe to remove USB")
+    print("1. Check for existing USB drives")
+    print("2. Wait for new USB insertion")
+    print("3. Ask for confirmation to scan")
+    print("4. Scan all files on the USB")
+    print("5. Check files against VirusTotal")
+    print("6. Remove any infected files found")
+    print("7. Notify you when safe to remove USB")
     print("\nPress Ctrl+C to stop the scanner\n")
     
     scanner = USBVirusScanner(API_KEY)
